@@ -1,0 +1,112 @@
+%% 1. INITIALIZATION & RAW .CNT LOADING
+[ALLEEG, EEG, CURRENTSET, ALLCOM] = eeglab; % Open EEGLAB background workspace
+
+filepath = 'C:\Users\cwpan\Desktop\EEG-ipsilateral position\';
+raw_filename = 'SERP08_position_45-52_單_proc_convert.cdt.cnt'; % Raw Neuroscan recording in .cnt file format
+
+fprintf('Importing raw Neuroscan data: %s...\n', raw_filename);
+% Load the raw data format automatically while handling large files safely
+EEG = pop_loadcnt(fullfile(filepath, raw_filename), 'dataformat', 'auto', 'memmapfile', '');
+[ALLEEG, EEG, CURRENTSET] = eeg_store(ALLEEG, EEG, 0);
+
+%% 2. CREATE EVENTLIST & GENERATE BINS TEXT ON THE FLY
+fprintf('Creating ERPLAB EventList...\n');
+EEG = pop_creabasiceventlist(EEG, 'AlphanumericCleaning', 'on', 'BoundaryNumeric', {-99}, 'BoundaryString', {'boundary'});
+[ALLEEG, EEG, CURRENTSET] = eeg_store(ALLEEG, EEG, CURRENTSET); % <--- FIX: Sync to global memory
+
+ev_types = {EEG.event.type};
+for e = 1:length(ev_types)
+    if isnumeric(ev_types{e})
+        ev_types{e} = num2str(ev_types{e}); % Uniformly convert numbers to strings
+    end
+end
+% Filter out boundary markers
+ev_types(strcmpi(ev_types, 'boundary')) = [];
+
+% Compute appearance frequencies
+[unique_types, ~, unique_idx] = unique(ev_types);
+counts = histcounts(unique_idx, 1:numel(unique_types)+1);
+
+% Sort triggers from highest count to lowest count
+[sorted_counts, sort_order] = sort(counts, 'descend');
+sorted_triggers = unique_types(sort_order);
+
+% Isolate only the top 4 most frequent experimental triggers
+num_bins = min(4, length(sorted_triggers));
+detected_triggers = sorted_triggers(1:num_bins);
+
+fprintf('\n=== AUTO-DETECTED TOP EXPERIMENTAL TRIGGERS ===\n');
+for b = 1:num_bins
+    fprintf('Bin %d -> Trigger %s (Appears %d times)\n', b, detected_triggers{b}, sorted_counts(b));
+end
+fprintf('===============================================\n\n');
+
+% DYNAMIC BINS FILE CREATION
+bin_file_path = fullfile(filepath, 'autobins.txt');
+fid = fopen(bin_file_path, 'w');
+for b = 1:num_bins
+    fprintf(fid, 'bin %d\nTrigger_%s\n.{%s}\n\n', b, detected_triggers{b}, detected_triggers{b});
+end
+fclose(fid);
+
+% Assign the dynamically discovered triggers to your bins
+EEG = pop_binlister(EEG, 'BDF', bin_file_path, 'IndexEL', 1, 'SendEL2', 'EEG', 'Voutput', 'EEG');
+
+%% 3. EXTRACT BIN-BASED EPOCHS WITH BASELINE CORRECTION
+fprintf('Extracting epochs (-500 to 1000 ms) with custom baseline (-200 to 0 ms)...\n');
+EEG = pop_epochbin(EEG, [-500.0  1000.0], [-200 0]);
+[ALLEEG, EEG, CURRENTSET] = eeg_store(ALLEEG, EEG, 1);
+
+%% 4. AUTOMATED ARTIFACT DETECTION (THRESHOLD \pm100 \muV)
+fprintf('Scanning for eye blinks and high voltage motor artifacts...\n');
+EEG = pop_artextval(EEG, 'Channel', 1:34, 'Flag', 1, 'LowPass', -1, 'Threshold', [-100 100], 'Twindow', [-500 1000]);
+
+%% 5. COMPUTE AVERAGED ERP & PRINT REJECTION SUMMARY
+fprintf('Averaging clean epochs into ERP structure...\n');
+ERP = pop_averager(EEG, 'Criterion', 'good', 'DQ_flag', 0); 
+
+% Print out your trigger/bin summary to the command window automatically
+fprintf('\n=== PIPELINE STATUS REPORT ===\n');
+fprintf('Successfully generated ERP set: %s\n', ERP.erpname);
+fprintf('==============================\n\n');
+
+%% 6. GENERATE THE STACKED SUBPLOT GRAPH (Fz, FCz, Cz) - LIGHT MODE
+fprintf('Generating final 3-channel publication figure...\n');
+figure('Color', 'w', 'Position', [100, 100, 600, 800]); % Force white background
+time_ms = ERP.times;
+target_chans = {'Fz', 'FCz', 'Cz'};
+
+% Dynamically build the legend labels using our auto-detected triggers
+legend_labels = cell(1, num_bins);
+for b = 1:num_bins
+    legend_labels{b} = sprintf('Bin %d (Trig %s)', b, detected_triggers{b});
+end
+
+for i = 1:length(target_chans)
+    ch_idx = find(strcmpi({ERP.chanlocs.labels}, target_chans{i}));
+    
+    if ~isempty(ch_idx)
+        subplot(3, 1, i); 
+        hold on;
+        
+        % Plot all detected conditions dynamically
+        plot(time_ms, squeeze(ERP.bindata(ch_idx, :, 1:num_bins)), 'LineWidth', 1.8);
+        
+        % Formatting to Scientific Standard (Light Mode)
+        xlim([-200 800]);
+        grid on;
+        set(gca, 'Color', 'w', 'XColor', 'k', 'YColor', 'k', 'GridColor', 'k', 'FontSize', 11);
+        line([0 0], ylim, 'Color', 'k', 'LineStyle', '--', 'LineWidth', 1); 
+        line(xlim, [0 0], 'Color', 'k', 'LineWidth', 1); 
+        
+        ylabel('Amplitude (\muV)', 'Color', 'k', 'FontWeight', 'bold');
+        title(['Electrode: ' target_chans{i}], 'Color', 'k', 'FontWeight', 'bold');
+        
+        if i == 3
+            xlabel('Time (ms)', 'Color', 'k', 'FontWeight', 'bold');
+            legend(legend_labels, 'Location', 'best', 'TextColor', 'k', 'Color', 'w');
+        end
+        hold off;
+    end
+end
+fprintf('Done! Single-subject analysis finished.\n');
